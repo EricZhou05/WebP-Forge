@@ -53,6 +53,7 @@ def get_cwebp_path() -> str:
 def get_cwebp_cmd(input_file: Path, output_file: Path) -> list[str]:
     return [
         get_cwebp_path(),
+        "-mt",  # 开启多线程榨干单核性能
         "-m", "6",
         "-q", "95",
         "-alpha_q", "100",
@@ -131,7 +132,7 @@ def main():
     parser = argparse.ArgumentParser(description="二次元插画高保真批量压缩工具")
     parser.add_argument("-s", "--src", help="源目录")
     parser.add_argument("-b", "--backup", help="备份目录")
-    parser.add_argument("-w", "--workers", type=int, default=os.cpu_count())
+    parser.add_argument("-w", "--workers", type=int, default=max(1, os.cpu_count() - 1))
     args = parser.parse_args()
 
     console.print(Panel.fit("[bold magenta]WebP-Forge 极致压缩工具[/bold magenta]\n[cyan]高保真 / 多核并行 / 自动备份[/cyan]", border_style="magenta"))
