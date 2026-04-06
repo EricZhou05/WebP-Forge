@@ -1,5 +1,7 @@
 @echo off
 title WebP-Forge: 二次元插画高保真批量压缩工具
+:: 强制使用 UTF-8 编码显示，解决 .bat 运行时的乱码
+chcp 65001 > nul
 cd /d %~dp0
 
 :: 检查并创建虚拟环境
