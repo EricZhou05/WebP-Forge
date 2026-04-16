@@ -112,17 +112,24 @@ def worker(input_file: Path) -> dict:
             output_file.unlink()
         return {'status': 'error', 'input': input_file, 'error': str(e)}
 
-def move_originals(src_dir: Path, backup_dir: Path, image_files: list[Path], progress: Progress, task_id: TaskID):
+def move_originals(src_dir: Path, backup_dir: Path, image_files: list[Path], progress: Progress, task_id: TaskID, is_single_file: bool = False):
     for img_file in image_files:
         try:
-            rel_path = img_file.relative_to(src_dir)
-            dest_file = backup_dir / rel_path
-            dest_file.parent.mkdir(parents=True, exist_ok=True)
+            if is_single_file:
+                # 单文件模式：直接在原位重命名，例如 1.png -> 1_forge.png
+                dest_file = img_file.parent / f"{img_file.stem}_forge{img_file.suffix}"
+                display_path = dest_file.name
+            else:
+                # 目录模式：保持原有的备份逻辑
+                rel_path = img_file.relative_to(src_dir)
+                dest_file = backup_dir / rel_path
+                dest_file.parent.mkdir(parents=True, exist_ok=True)
+                display_path = str(rel_path)
             
             if dest_file.exists():
                 dest_file.unlink()
             shutil.move(str(img_file), str(dest_file))
-            logging.info(f"[MOVE] 已归档: {rel_path}")
+            logging.info(f"[MOVE] 已归档: {display_path}")
         except Exception as e:
             logging.error(f"[MOVE_ERROR] {img_file.name} 移动失败: {e}")
         
@@ -130,50 +137,69 @@ def move_originals(src_dir: Path, backup_dir: Path, image_files: list[Path], pro
 
 def main():
     parser = argparse.ArgumentParser(description="二次元插画高保真批量压缩工具")
-    parser.add_argument("-s", "--src", help="源目录")
+    parser.add_argument("-s", "--src", help="源目录或文件")
     parser.add_argument("-b", "--backup", help="备份目录")
     parser.add_argument("-w", "--workers", type=int, default=max(1, os.cpu_count() - 1))
     args = parser.parse_args()
 
     console.print(Panel.fit("[bold magenta]WebP-Forge 极致压缩工具[/bold magenta]\n[cyan]高保真 / 多核并行 / 自动备份[/cyan]", border_style="magenta"))
 
-    if not args.src or not args.backup:
-        src_input = console.input("[bold green]输入源文件夹 (支持直接拖入): [/bold green]").strip().strip('"')
-        src_dir = Path(src_input).resolve()
-        
-        default_backup = src_dir.parent / f"{src_dir.name}_forge"
-        
-        if not args.backup:
-            console.print(f"[cyan]建议备份目录: {default_backup}[/cyan]")
-            backup_input = console.input(f"[bold green]输入备份文件夹 (回车使用建议): [/bold green]").strip().strip('"')
-            backup_dir = Path(backup_input).resolve() if backup_input else default_backup
-        else:
-            backup_dir = Path(args.backup).resolve()
-        workers = args.workers
+    # 1. 获取源路径
+    if not args.src:
+        src_input = console.input("[bold green]输入源文件夹或图片文件 (支持直接拖入): [/bold green]").strip().strip("\"")
+        src_path = Path(src_input).resolve()
     else:
-        src_dir = Path(args.src).resolve()
-        backup_dir = Path(args.backup).resolve()
-        workers = args.workers
+        src_path = Path(args.src).resolve()
 
-    log_file = setup_logging(src_dir / "logs")
-    logging.info(f"=== 任务启动: {datetime.datetime.now()} ===")
-    logging.info(f"源路径: {src_dir}")
-    logging.info(f"备份路径: {backup_dir}")
-    logging.info(f"并发数: {workers}")
-
-    if not src_dir.is_dir():
-        logging.error(f"源目录不可用: {src_dir}")
+    if not src_path.exists():
+        console.print(f"[bold red]错误: 路径不存在 {src_path}[/bold red]")
         return
 
-    with console.status("[bold yellow]正在扫描图片资源...", spinner="bouncingBall"):
-        image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif'}
-        image_files = [f for f in src_dir.rglob("*") if f.is_file() and f.suffix.lower() in image_extensions]
+    # 2. 判定处理模式并确定基础目录与待处理文件
+    is_single_file = src_path.is_file()
+    image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif'}
+    
+    if is_single_file:
+        if src_path.suffix.lower() not in image_extensions:
+            console.print(f"[bold red]错误: 不支持的文件格式 {src_path.suffix}[/bold red]")
+            return
+        src_dir = src_path.parent
+        image_files = [src_path]
+    else:
+        src_dir = src_path
+        with console.status("[bold yellow]正在扫描图片资源...", spinner="bouncingBall"):
+            image_files = [f for f in src_dir.rglob("*") if f.is_file() and f.suffix.lower() in image_extensions]
 
     if not image_files:
         console.print("[yellow]未找到待处理的图片格式。[/yellow]")
         return
 
-    logging.info(f"扫描完成，待处理: {len(image_files)} 张")
+    # 3. 确定备份目录
+    if is_single_file:
+        backup_dir = src_dir # 实际上单文件模式不使用 backup_dir 路径拼接
+    else:
+        default_backup = src_dir.parent / f"{src_dir.name}_forge"
+        if not args.backup:
+            if not args.src: # 只有交互式运行才询问
+                console.print(f"[cyan]建议备份目录: {default_backup}[/cyan]")
+                backup_input = console.input(f"[bold green]输入备份文件夹 (回车使用建议): [/bold green]").strip().strip("\"")
+                backup_dir = Path(backup_input).resolve() if backup_input else default_backup
+            else:
+                backup_dir = default_backup
+        else:
+            backup_dir = Path(args.backup).resolve()
+
+    workers = args.workers
+
+    log_file = setup_logging(src_dir / "logs")
+    logging.info(f"=== 任务启动: {datetime.datetime.now()} ===")
+    logging.info(f"源路径: {src_path}")
+    logging.info(f"备份模式: {'单文件原位备份' if is_single_file else '目录归档'}")
+    if not is_single_file:
+        logging.info(f"备份路径: {backup_dir}")
+    logging.info(f"并发数: {workers}")
+
+    logging.info(f"待处理: {len(image_files)} 张")
 
     success_count = 0
     skipped_count = 0
@@ -236,7 +262,7 @@ def main():
     if files_to_move:
         move_task_id = progress.add_task("[yellow]正在归档原图...", total=len(files_to_move))
         with progress:
-            move_originals(src_dir, backup_dir, files_to_move, progress, move_task_id)
+            move_originals(src_dir, backup_dir, files_to_move, progress, move_task_id, is_single_file=is_single_file)
 
     logging.info(f"=== 任务结束: {datetime.datetime.now()} ===")
     console.print(f"\n[bold green]✅ 任务全部完成！日志已存至源目录 logs 文件夹。[/bold green]")
