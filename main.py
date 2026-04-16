@@ -214,6 +214,13 @@ def main():
                 
                 progress.update(compress_task, advance=1)
 
+    # 4. 移动
+    files_to_move = [f for f in image_files if f.with_suffix('.webp').exists() and f.exists()]
+    if files_to_move:
+        move_task_id = progress.add_task("[yellow]正在归档原图...", total=len(files_to_move))
+        with progress:
+            move_originals(src_dir, backup_dir, files_to_move, progress, move_task_id)
+
     # --- 改进的统计表 ---
     table = Table(title="📊 压缩任务总结", box=None, show_header=False)
     table.add_column("Key", style="bold cyan")
@@ -222,21 +229,23 @@ def main():
     table.add_row("成功完成", f"[green]{success_count}[/green] 张")
     table.add_row("错误失败", f"[red]{error_count}[/red] 张")
     
+    # 同时记录到日志文件
+    logging.info("📊 压缩任务总结")
+    logging.info(f"成功完成: {success_count} 张")
+    logging.info(f"错误失败: {error_count} 张")
+    
     if success_count > 0:
         reduction = total_orig_size - total_new_size
         reduction_percent = (reduction / total_orig_size) * 100
         table.add_row("原始总体积", f"{total_orig_size / (1024*1024):.2f} MB")
         table.add_row("压缩后体积", f"{total_new_size / (1024*1024):.2f} MB")
         table.add_row("空间缩减率", f"[bold green]{reduction_percent:.1f}%[/bold green] (节省 {reduction / (1024*1024):.2f} MB)")
+        
+        logging.info(f"原始总体积: {total_orig_size / (1024*1024):.2f} MB")
+        logging.info(f"压缩后体积: {total_new_size / (1024*1024):.2f} MB")
+        logging.info(f"空间缩减率: {reduction_percent:.1f}% (节省 {reduction / (1024*1024):.2f} MB)")
 
     console.print("\n", table)
-
-    # 4. 移动
-    files_to_move = [f for f in image_files if f.with_suffix('.webp').exists() and f.exists()]
-    if files_to_move:
-        move_task_id = progress.add_task("[yellow]正在归档原图...", total=len(files_to_move))
-        with progress:
-            move_originals(src_dir, backup_dir, files_to_move, progress, move_task_id)
 
     logging.info(f"=== 任务结束: {datetime.datetime.now()} ===")
     console.print(f"\n[bold green]✅ 任务全部完成！日志已存至源目录 logs 文件夹。[/bold green]")
