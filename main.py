@@ -158,7 +158,7 @@ def main():
     # 2. 判定处理模式并确定基础目录与待处理文件
     is_single_file = src_path.is_file()
     image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif'}
-    
+
     if is_single_file:
         if src_path.suffix.lower() not in image_extensions:
             console.print(f"[bold red]错误: 不支持的文件格式 {src_path.suffix}[/bold red]")
@@ -179,6 +179,7 @@ def main():
         backup_dir = src_dir # 实际上单文件模式不使用 backup_dir 路径拼接
     else:
         default_backup = src_dir.parent / f"{src_dir.name}_forge"
+        
         if not args.backup:
             if not args.src: # 只有交互式运行才询问
                 console.print(f"[cyan]建议备份目录: {default_backup}[/cyan]")
@@ -248,12 +249,21 @@ def main():
     table.add_row("成功完成", f"[green]{success_count}[/green] 张")
     table.add_row("错误失败", f"[red]{error_count}[/red] 张")
     
+    # 同时记录到日志文件
+    logging.info("📊 压缩任务总结")
+    logging.info(f"成功完成: {success_count} 张")
+    logging.info(f"错误失败: {error_count} 张")
+
     if success_count > 0:
         reduction = total_orig_size - total_new_size
         reduction_percent = (reduction / total_orig_size) * 100
         table.add_row("原始总体积", f"{total_orig_size / (1024*1024):.2f} MB")
         table.add_row("压缩后体积", f"{total_new_size / (1024*1024):.2f} MB")
         table.add_row("空间缩减率", f"[bold green]{reduction_percent:.1f}%[/bold green] (节省 {reduction / (1024*1024):.2f} MB)")
+
+        logging.info(f"原始总体积: {total_orig_size / (1024*1024):.2f} MB")
+        logging.info(f"压缩后体积: {total_new_size / (1024*1024):.2f} MB")
+        logging.info(f"空间缩减率: {reduction_percent:.1f}% (节省 {reduction / (1024*1024):.2f} MB)")
 
     console.print("\n", table)
 
