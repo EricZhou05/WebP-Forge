@@ -241,7 +241,14 @@ def main():
                 
                 progress.update(compress_task, advance=1)
 
-    # --- 改进的统计表 ---
+    # 4. 移动
+    files_to_move = [f for f in image_files if f.with_suffix('.webp').exists() and f.exists()]
+    if files_to_move:
+        move_task_id = progress.add_task("[yellow]正在归档原图...", total=len(files_to_move))
+        with progress:
+            move_originals(src_dir, backup_dir, files_to_move, progress, move_task_id, is_single_file=is_single_file)
+
+    # --- 统计总结 (移动到最后防止被归档日志冲掉) ---
     table = Table(title="📊 压缩任务总结", box=None, show_header=False)
     table.add_column("Key", style="bold cyan")
     table.add_column("Value")
@@ -266,13 +273,6 @@ def main():
         logging.info(f"空间缩减率: {reduction_percent:.1f}% (节省 {reduction / (1024*1024):.2f} MB)")
 
     console.print("\n", table)
-
-    # 4. 移动
-    files_to_move = [f for f in image_files if f.with_suffix('.webp').exists() and f.exists()]
-    if files_to_move:
-        move_task_id = progress.add_task("[yellow]正在归档原图...", total=len(files_to_move))
-        with progress:
-            move_originals(src_dir, backup_dir, files_to_move, progress, move_task_id, is_single_file=is_single_file)
 
     logging.info(f"=== 任务结束: {datetime.datetime.now()} ===")
     console.print(f"\n[bold green]✅ 任务全部完成！日志已存至源目录 logs 文件夹。[/bold green]")
