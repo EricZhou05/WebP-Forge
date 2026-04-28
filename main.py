@@ -7,6 +7,7 @@ import argparse
 import sys
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from PIL import Image
 
 from rich.console import Console
 from rich.progress import (
@@ -112,6 +113,33 @@ def worker(input_file: Path) -> dict:
             output_file.unlink()
         return {'status': 'error', 'input': input_file, 'error': str(e)}
 
+def restore_worker(input_file: Path) -> dict:
+    output_file = input_file.with_suffix('.png')
+    
+    if output_file.exists() and output_file.stat().st_size > 0:
+        return {'status': 'skipped', 'input': input_file, 'output': output_file}
+
+    try:
+        # 使用 Pillow 无损还原 WebP 到 PNG
+        with Image.open(input_file) as img:
+            img.save(output_file, "PNG")
+        
+        orig_size = input_file.stat().st_size
+        new_size = output_file.stat().st_size
+        return {
+            'status': 'success', 
+            'input': input_file, 
+            'output': output_file, 
+            'orig_size': orig_size, 
+            'new_size': new_size,
+            'cmd': "PIL.Image.save (PNG)"
+        }
+        
+    except Exception as e:
+        if output_file.exists():
+            output_file.unlink()
+        return {'status': 'error', 'input': input_file, 'error': str(e)}
+
 def move_originals(src_dir: Path, backup_dir: Path, image_files: list[Path], progress: Progress, task_id: TaskID, is_single_file: bool = False):
     for img_file in image_files:
         try:
@@ -136,17 +164,26 @@ def move_originals(src_dir: Path, backup_dir: Path, image_files: list[Path], pro
         progress.update(task_id, advance=1)
 
 def main():
-    parser = argparse.ArgumentParser(description="二次元插画高保真批量压缩工具")
+    parser = argparse.ArgumentParser(description="二次元插画高保真批量压缩/还原工具")
     parser.add_argument("-s", "--src", help="源目录或文件")
     parser.add_argument("-b", "--backup", help="备份目录")
     parser.add_argument("-w", "--workers", type=int, default=max(1, os.cpu_count() - 1))
+    parser.add_argument("-m", "--mode", choices=["compress", "restore"], help="操作模式: compress (压缩) 或 restore (还原)")
     args = parser.parse_args()
 
-    console.print(Panel.fit("[bold magenta]WebP-Forge 极致压缩工具[/bold magenta]\n[cyan]高保真 / 多核并行 / 自动备份[/cyan]", border_style="magenta"))
+    console.print(Panel.fit("[bold magenta]WebP-Forge 极致压缩/还原工具[/bold magenta]\n[cyan]高保真 / 多核并行 / 自动备份[/cyan]", border_style="magenta"))
+
+    # 0. 选择模式
+    if not args.mode:
+        mode_choice = console.input("[bold green]请选择模式 [1] 极致压缩 (PNG/JPG -> WebP) [2] 无损还原 (WebP -> PNG) [默认1]: [/bold green]").strip()
+        mode = "restore" if mode_choice == "2" else "compress"
+    else:
+        mode = args.mode
 
     # 1. 获取源路径
     if not args.src:
-        src_input = console.input("[bold green]输入源文件夹或图片文件 (支持直接拖入): [/bold green]").strip().strip("\"")
+        prompt = "[bold green]输入源文件夹或图片文件 (支持直接拖入): [/bold green]" if mode == "compress" else "[bold green]输入包含 WebP 的文件夹或文件: [/bold green]"
+        src_input = console.input(prompt).strip().strip("\"")
         src_path = Path(src_input).resolve()
     else:
         src_path = Path(args.src).resolve()
@@ -157,7 +194,10 @@ def main():
 
     # 2. 判定处理模式并确定基础目录与待处理文件
     is_single_file = src_path.is_file()
-    image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif'}
+    if mode == "compress":
+        image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif'}
+    else:
+        image_extensions = {'.webp'}
 
     if is_single_file:
         if src_path.suffix.lower() not in image_extensions:
@@ -220,10 +260,13 @@ def main():
     )
 
     with progress:
-        compress_task = progress.add_task("[white]执行极致压缩...", total=len(image_files))
+        task_desc = "[white]执行极致压缩..." if mode == "compress" else "[white]执行无损还原..."
+        process_task = progress.add_task(task_desc, total=len(image_files))
         
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            future_to_file = {executor.submit(worker, f): f for f in image_files}
+            # 根据模式选择 worker
+            target_worker = worker if mode == "compress" else restore_worker
+            future_to_file = {executor.submit(target_worker, f): f for f in image_files}
             
             for future in as_completed(future_to_file):
                 res = future.result()
@@ -239,17 +282,19 @@ def main():
                     error_count += 1
                     logging.error(f"[ERROR] {res['input'].name} -> {res['error']}")
                 
-                progress.update(compress_task, advance=1)
+                progress.update(process_task, advance=1)
 
     # 4. 移动
-    files_to_move = [f for f in image_files if f.with_suffix('.webp').exists() and f.exists()]
+    target_ext = '.webp' if mode == "compress" else '.png'
+    files_to_move = [f for f in image_files if f.with_suffix(target_ext).exists() and f.exists()]
     if files_to_move:
         move_task_id = progress.add_task("[yellow]正在归档原图...", total=len(files_to_move))
         with progress:
             move_originals(src_dir, backup_dir, files_to_move, progress, move_task_id, is_single_file=is_single_file)
 
     # --- 统计总结 (移动到最后防止被归档日志冲掉) ---
-    table = Table(title="📊 压缩任务总结", box=None, show_header=False)
+    summary_title = "📊 压缩任务总结" if mode == "compress" else "📊 还原任务总结"
+    table = Table(title=summary_title, box=None, show_header=False)
     table.add_column("Key", style="bold cyan")
     table.add_column("Value")
     
@@ -257,20 +302,26 @@ def main():
     table.add_row("错误失败", f"[red]{error_count}[/red] 张")
     
     # 同时记录到日志文件
-    logging.info("📊 压缩任务总结")
+    logging.info(summary_title)
     logging.info(f"成功完成: {success_count} 张")
     logging.info(f"错误失败: {error_count} 张")
 
     if success_count > 0:
-        reduction = total_orig_size - total_new_size
-        reduction_percent = (reduction / total_orig_size) * 100
-        table.add_row("原始总体积", f"{total_orig_size / (1024*1024):.2f} MB")
-        table.add_row("压缩后体积", f"{total_new_size / (1024*1024):.2f} MB")
-        table.add_row("空间缩减率", f"[bold green]{reduction_percent:.1f}%[/bold green] (节省 {reduction / (1024*1024):.2f} MB)")
+        if mode == "compress":
+            reduction = total_orig_size - total_new_size
+            reduction_percent = (reduction / total_orig_size) * 100
+            table.add_row("原始总体积", f"{total_orig_size / (1024*1024):.2f} MB")
+            table.add_row("压缩后体积", f"{total_new_size / (1024*1024):.2f} MB")
+            table.add_row("空间缩减率", f"[bold green]{reduction_percent:.1f}%[/bold green] (节省 {reduction / (1024*1024):.2f} MB)")
 
-        logging.info(f"原始总体积: {total_orig_size / (1024*1024):.2f} MB")
-        logging.info(f"压缩后体积: {total_new_size / (1024*1024):.2f} MB")
-        logging.info(f"空间缩减率: {reduction_percent:.1f}% (节省 {reduction / (1024*1024):.2f} MB)")
+            logging.info(f"原始总体积: {total_orig_size / (1024*1024):.2f} MB")
+            logging.info(f"压缩后体积: {total_new_size / (1024*1024):.2f} MB")
+            logging.info(f"空间缩减率: {reduction_percent:.1f}% (节省 {reduction / (1024*1024):.2f} MB)")
+        else:
+            table.add_row("WebP 总体积", f"{total_orig_size / (1024*1024):.2f} MB")
+            table.add_row("还原后体积", f"{total_new_size / (1024*1024):.2f} MB")
+            logging.info(f"WebP 总体积: {total_orig_size / (1024*1024):.2f} MB")
+            logging.info(f"还原后体积: {total_new_size / (1024*1024):.2f} MB")
 
     console.print("\n", table)
 
