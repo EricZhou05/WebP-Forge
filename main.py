@@ -72,8 +72,18 @@ def get_cwebp_cmd(input_file: Path, output_file: Path) -> list[str]:
         str(output_file)
     ]
 
-def worker(input_file: Path) -> dict:
-    output_file = input_file.with_suffix('.webp')
+def worker(input_file: Path, rename_mode: bool = False) -> dict:
+    # 获取原始文件的修改时间和访问时间
+    orig_stat = input_file.stat()
+    orig_mtime = orig_stat.st_mtime
+    orig_atime = orig_stat.st_atime
+    
+    if rename_mode:
+        # 格式 YYYY_MM_DD_原始文件名
+        date_prefix = datetime.datetime.fromtimestamp(orig_mtime).strftime('%Y_%m_%d')
+        output_file = input_file.parent / f"{date_prefix}_{input_file.stem}.webp"
+    else:
+        output_file = input_file.with_suffix('.webp')
     
     if output_file.exists() and output_file.stat().st_size > 0:
         return {'status': 'skipped', 'input': input_file, 'output': output_file}
@@ -96,6 +106,9 @@ def worker(input_file: Path) -> dict:
             if output_file.exists():
                 output_file.unlink()
             return {'status': 'error', 'input': input_file, 'error': result.stderr.strip()}
+        
+        # 压缩成功后，同步修改时间
+        os.utime(output_file, (orig_atime, orig_mtime))
         
         orig_size = input_file.stat().st_size
         new_size = output_file.stat().st_size
@@ -168,21 +181,31 @@ def main():
     parser.add_argument("-s", "--src", help="源目录或文件")
     parser.add_argument("-b", "--backup", help="备份目录")
     parser.add_argument("-w", "--workers", type=int, default=max(1, os.cpu_count() - 1))
-    parser.add_argument("-m", "--mode", choices=["compress", "restore"], help="操作模式: compress (压缩) 或 restore (还原)")
+    parser.add_argument("-m", "--mode", choices=["compress", "compress_rename", "restore"], help="操作模式: compress (压缩), compress_rename (压缩并重命名), restore (还原)")
     args = parser.parse_args()
 
     console.print(Panel.fit("[bold magenta]WebP-Forge 极致压缩/还原工具[/bold magenta]\n[cyan]高保真 / 多核并行 / 自动备份[/cyan]", border_style="magenta"))
 
     # 0. 选择模式
     if not args.mode:
-        mode_choice = console.input("[bold green]请选择模式 [1] 极致压缩 (PNG/JPG -> WebP) [2] 无损还原 (WebP -> PNG) [默认1]: [/bold green]").strip()
-        mode = "restore" if mode_choice == "2" else "compress"
+        console.print("[bold green]请选择模式:[/bold green]")
+        console.print("  [1] 极致压缩 (保持原名 + 保留原始修改时间)")
+        console.print("  [2] 压缩且重命名 (日期前缀 + 保留原始修改时间)")
+        console.print("  [3] 无损还原 (WebP -> PNG)")
+        mode_choice = console.input("[bold green]请输入选项 [默认1]: [/bold green]").strip()
+        
+        if mode_choice == "2":
+            mode = "compress_rename"
+        elif mode_choice == "3":
+            mode = "restore"
+        else:
+            mode = "compress"
     else:
         mode = args.mode
 
     # 1. 获取源路径
     if not args.src:
-        prompt = "[bold green]输入源文件夹或图片文件 (支持直接拖入): [/bold green]" if mode == "compress" else "[bold green]输入包含 WebP 的文件夹或文件: [/bold green]"
+        prompt = "[bold green]输入源文件夹或图片文件 (支持直接拖入): [/bold green]" if mode.startswith("compress") else "[bold green]输入包含 WebP 的文件夹或文件: [/bold green]"
         src_input = console.input(prompt).strip().strip("\"")
         src_path = Path(src_input).resolve()
     else:
@@ -194,7 +217,7 @@ def main():
 
     # 2. 判定处理模式并确定基础目录与待处理文件
     is_single_file = src_path.is_file()
-    if mode == "compress":
+    if mode.startswith("compress"):
         image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif'}
     else:
         image_extensions = {'.webp'}
@@ -235,6 +258,7 @@ def main():
     log_file = setup_logging(src_dir / "logs")
     logging.info(f"=== 任务启动: {datetime.datetime.now()} ===")
     logging.info(f"源路径: {src_path}")
+    logging.info(f"模式: {mode}")
     logging.info(f"备份模式: {'单文件原位备份' if is_single_file else '目录归档'}")
     if not is_single_file:
         logging.info(f"备份路径: {backup_dir}")
@@ -247,6 +271,9 @@ def main():
     error_count = 0
     total_orig_size = 0
     total_new_size = 0
+    
+    # 用于记录哪些原始文件需要移动
+    successful_inputs = []
 
     progress = Progress(
         SpinnerColumn(),
@@ -260,12 +287,21 @@ def main():
     )
 
     with progress:
-        task_desc = "[white]执行极致压缩..." if mode == "compress" else "[white]执行无损还原..."
+        if mode.startswith("compress"):
+            task_desc = "[white]执行极致压缩..."
+        else:
+            task_desc = "[white]执行无损还原..."
         process_task = progress.add_task(task_desc, total=len(image_files))
         
+        from functools import partial
         with ProcessPoolExecutor(max_workers=workers) as executor:
             # 根据模式选择 worker
-            target_worker = worker if mode == "compress" else restore_worker
+            if mode.startswith("compress"):
+                rename_flag = (mode == "compress_rename")
+                target_worker = partial(worker, rename_mode=rename_flag)
+            else:
+                target_worker = restore_worker
+                
             future_to_file = {executor.submit(target_worker, f): f for f in image_files}
             
             for future in as_completed(future_to_file):
@@ -274,26 +310,24 @@ def main():
                     success_count += 1
                     total_orig_size += res['orig_size']
                     total_new_size += res['new_size']
-                    logging.info(f"[SUCCESS] {res['input'].name} | 参数: {res['cmd']}")
+                    successful_inputs.append(res['input'])
+                    logging.info(f"[SUCCESS] {res['input'].name} -> {res['output'].name}")
                 elif res['status'] == 'skipped':
                     skipped_count += 1
-                    logging.info(f"[SKIP] {res['input'].name} 已存在。")
+                    logging.info(f"[SKIP] {res['input'].name} 的对应文件已存在。")
                 elif res['status'] == 'error':
                     error_count += 1
                     logging.error(f"[ERROR] {res['input'].name} -> {res['error']}")
                 
                 progress.update(process_task, advance=1)
 
-    # 4. 移动
-    target_ext = '.webp' if mode == "compress" else '.png'
-    files_to_move = [f for f in image_files if f.with_suffix(target_ext).exists() and f.exists()]
-    if files_to_move:
-        move_task_id = progress.add_task("[yellow]正在归档原图...", total=len(files_to_move))
-        with progress:
-            move_originals(src_dir, backup_dir, files_to_move, progress, move_task_id, is_single_file=is_single_file)
+        # 4. 移动原图 (放在同一个 progress 块内)
+        if successful_inputs:
+            move_task_id = progress.add_task("[yellow]正在归档原图...", total=len(successful_inputs))
+            move_originals(src_dir, backup_dir, successful_inputs, progress, move_task_id, is_single_file=is_single_file)
 
-    # --- 统计总结 (移动到最后防止被归档日志冲掉) ---
-    summary_title = "📊 压缩任务总结" if mode == "compress" else "📊 还原任务总结"
+    # --- 统计总结 ---
+    summary_title = "📊 任务总结"
     table = Table(title=summary_title, box=None, show_header=False)
     table.add_column("Key", style="bold cyan")
     table.add_column("Value")
