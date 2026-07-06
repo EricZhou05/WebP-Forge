@@ -30,20 +30,16 @@ if sys.platform == "win32":
 
 console = Console()
 
-def setup_logging(log_dir: Path):
+def setup_file_logging(log_dir: Path):
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / f"compress_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(message)s",
-        datefmt="[%X]",
-        handlers=[
-            RichHandler(console=console, rich_tracebacks=True),
-            logging.FileHandler(log_file, encoding='utf-8')
-        ]
-    )
-    return log_file
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    formatter = logging.Formatter("%(message)s")
+    file_handler.setFormatter(formatter)
+    logging.getLogger().addHandler(file_handler)
+    
+    return file_handler, log_file
 
 def get_cwebp_path() -> str:
     local_cwebp = Path(__file__).resolve().parent / "bin" / "cwebp.exe"
@@ -184,183 +180,197 @@ def main():
     parser.add_argument("-m", "--mode", choices=["compress", "compress_rename", "restore"], help="操作模式: compress (压缩), compress_rename (压缩并重命名), restore (还原)")
     args = parser.parse_args()
 
+    # 初始化全局控制台日志
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        datefmt="[%X]",
+        handlers=[RichHandler(console=console, rich_tracebacks=True)]
+    )
+
     console.print(Panel.fit("[bold magenta]WebP-Forge 极致压缩/还原工具[/bold magenta]\n[cyan]高保真 / 多核并行 / 自动备份[/cyan]", border_style="magenta"))
 
-    # 0. 选择模式
     if not args.mode:
-        console.print("[bold green]请选择模式:[/bold green]")
-        console.print("  [1] 极致压缩 (保持原名 + 保留原始修改时间)")
+        console.print("[bold green]可选模式:[/bold green]")
+        console.print("  [1] 极致压缩 (默认模式，直接输入路径即可)")
         console.print("  [2] 压缩且重命名 (日期前缀 + 保留原始修改时间)")
         console.print("  [3] 无损还原 (WebP -> PNG)")
-        mode_choice = console.input("[bold green]请输入选项 [默认1]: [/bold green]").strip()
         
-        if mode_choice == "2":
+        src_input = console.input("\n[bold green]请输入待处理的路径 (或输入 2 / 3 切换模式): [/bold green]").strip().strip("\"")
+        
+        mode = "compress"
+        if src_input == "2":
             mode = "compress_rename"
-        elif mode_choice == "3":
+            src_input = console.input("[bold green]请输入待处理的路径 (模式二: 压缩且重命名): [/bold green]").strip().strip("\"")
+        elif src_input == "3":
             mode = "restore"
-        else:
+            src_input = console.input("[bold green]请输入待处理的路径 (模式三: 无损还原): [/bold green]").strip().strip("\"")
+        elif src_input == "1":
             mode = "compress"
-    else:
-        mode = args.mode
-
-    # 1. 获取源路径
-    if not args.src:
-        prompt = "[bold green]输入源文件夹或图片文件 (支持直接拖入): [/bold green]" if mode.startswith("compress") else "[bold green]输入包含 WebP 的文件夹或文件: [/bold green]"
-        src_input = console.input(prompt).strip().strip("\"")
+            src_input = console.input("[bold green]请输入待处理的路径 (模式一: 极致压缩): [/bold green]").strip().strip("\"")
+            
+        if not src_input:
+            console.print("[bold red]错误: 路径不能为空[/bold red]")
+            return
         src_path = Path(src_input).resolve()
     else:
+        mode = args.mode
+        if not args.src:
+            console.print("[bold red]错误: 命令行模式下未指定源路径 --src[/bold red]")
+            return
         src_path = Path(args.src).resolve()
 
     if not src_path.exists():
         console.print(f"[bold red]错误: 路径不存在 {src_path}[/bold red]")
         return
 
-    # 2. 判定处理模式并确定基础目录与待处理文件
     is_single_file = src_path.is_file()
     if mode.startswith("compress"):
         image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif'}
     else:
         image_extensions = {'.webp'}
 
+    # 扫描任务，拆分为独立的文件夹任务
     if is_single_file:
         if src_path.suffix.lower() not in image_extensions:
             console.print(f"[bold red]错误: 不支持的文件格式 {src_path.suffix}[/bold red]")
             return
-        src_dir = src_path.parent
-        image_files = [src_path]
+        tasks = {src_path.parent: [src_path]}
     else:
-        src_dir = src_path
+        tasks = {}
         with console.status("[bold yellow]正在扫描图片资源...", spinner="bouncingBall"):
-            image_files = [f for f in src_dir.rglob("*") if f.is_file() and f.suffix.lower() in image_extensions]
+            for root, dirs, files in os.walk(src_path):
+                root_path = Path(root)
+                img_files = [root_path / f for f in files if (root_path / f).suffix.lower() in image_extensions]
+                if img_files:
+                    tasks[root_path] = img_files
 
-    if not image_files:
+    if not tasks:
         console.print("[yellow]未找到待处理的图片格式。[/yellow]")
         return
 
-    # 3. 确定备份目录
-    if is_single_file:
-        backup_dir = src_dir # 实际上单文件模式不使用 backup_dir 路径拼接
-    else:
-        default_backup = src_dir.parent / f"{src_dir.name}_forge"
-        
-        if not args.backup:
-            if not args.src: # 只有交互式运行才询问
-                console.print(f"[cyan]建议备份目录: {default_backup}[/cyan]")
-                backup_input = console.input(f"[bold green]输入备份文件夹 (回车使用建议): [/bold green]").strip().strip("\"")
-                backup_dir = Path(backup_input).resolve() if backup_input else default_backup
-            else:
-                backup_dir = default_backup
-        else:
-            backup_dir = Path(args.backup).resolve()
+    console.print(f"\n[bold cyan]扫描完毕，共发现 {len(tasks)} 个任务 (包含图片的文件夹):[/bold cyan]")
+    for idx, (dir_path, files) in enumerate(tasks.items(), 1):
+        console.print(f"  任务 {idx}: {dir_path} ({len(files)} 张图片)")
+    console.print("")
 
     workers = args.workers
 
-    log_file = setup_logging(src_dir / "logs")
-    logging.info(f"=== 任务启动: {datetime.datetime.now()} ===")
-    logging.info(f"源路径: {src_path}")
-    logging.info(f"模式: {mode}")
-    logging.info(f"备份模式: {'单文件原位备份' if is_single_file else '目录归档'}")
-    if not is_single_file:
-        logging.info(f"备份路径: {backup_dir}")
-    logging.info(f"并发数: {workers}")
+    global_success = 0
+    global_error = 0
+    global_skipped = 0
+    global_orig_size = 0
+    global_new_size = 0
 
-    logging.info(f"待处理: {len(image_files)} 张")
-
-    success_count = 0
-    skipped_count = 0
-    error_count = 0
-    total_orig_size = 0
-    total_new_size = 0
-    
-    # 用于记录哪些原始文件需要移动
-    successful_inputs = []
-
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(style="bright_black", complete_style="magenta"),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        "•",
-        TextColumn("[bold cyan]{task.completed}/{task.total}[/bold cyan]"),
-        TimeRemainingColumn(),
-        expand=True
-    )
-
-    with progress:
-        if mode.startswith("compress"):
-            task_desc = "[white]执行极致压缩..."
-        else:
-            task_desc = "[white]执行无损还原..."
-        process_task = progress.add_task(task_desc, total=len(image_files))
+    for idx, (task_dir, image_files) in enumerate(tasks.items(), 1):
+        console.print(f"\n[bold magenta]--- 正在处理任务 {idx}/{len(tasks)}: {task_dir} ---[/bold magenta]")
         
-        from functools import partial
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            # 根据模式选择 worker
-            if mode.startswith("compress"):
-                rename_flag = (mode == "compress_rename")
-                target_worker = partial(worker, rename_mode=rename_flag)
+        if is_single_file:
+            backup_dir = task_dir
+        else:
+            if not args.backup:
+                backup_dir = task_dir.parent / f"{task_dir.name}_forge"
             else:
-                target_worker = restore_worker
-                
-            future_to_file = {executor.submit(target_worker, f): f for f in image_files}
+                base_backup = Path(args.backup).resolve()
+                rel_path = task_dir.relative_to(src_path)
+                backup_dir = base_backup / rel_path
+
+        # 设置分目录的日志文件
+        file_handler, log_file_path = setup_file_logging(task_dir / "logs")
+        
+        logging.info(f"=== 任务 {idx} 启动: {datetime.datetime.now()} ===")
+        logging.info(f"任务路径: {task_dir}")
+        logging.info(f"模式: {mode}")
+        if not is_single_file:
+            logging.info(f"备份路径: {backup_dir}")
+        logging.info(f"待处理: {len(image_files)} 张")
+
+        success_count = 0
+        skipped_count = 0
+        error_count = 0
+        task_orig_size = 0
+        task_new_size = 0
+        successful_inputs = []
+
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(style="bright_black", complete_style="magenta"),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            "•",
+            TextColumn("[bold cyan]{task.completed}/{task.total}[/bold cyan]"),
+            TimeRemainingColumn(),
+            expand=True
+        )
+
+        with progress:
+            task_desc = f"[white]任务 {idx} 压缩中..." if mode.startswith("compress") else f"[white]任务 {idx} 还原中..."
+            process_task = progress.add_task(task_desc, total=len(image_files))
             
-            for future in as_completed(future_to_file):
-                res = future.result()
-                if res['status'] == 'success':
-                    success_count += 1
-                    total_orig_size += res['orig_size']
-                    total_new_size += res['new_size']
-                    successful_inputs.append(res['input'])
-                    logging.info(f"[SUCCESS] {res['input'].name} -> {res['output'].name}")
-                elif res['status'] == 'skipped':
-                    skipped_count += 1
-                    logging.info(f"[SKIP] {res['input'].name} 的对应文件已存在。")
-                elif res['status'] == 'error':
-                    error_count += 1
-                    logging.error(f"[ERROR] {res['input'].name} -> {res['error']}")
+            from functools import partial
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                if mode.startswith("compress"):
+                    rename_flag = (mode == "compress_rename")
+                    target_worker = partial(worker, rename_mode=rename_flag)
+                else:
+                    target_worker = restore_worker
+                    
+                future_to_file = {executor.submit(target_worker, f): f for f in image_files}
                 
-                progress.update(process_task, advance=1)
+                for future in as_completed(future_to_file):
+                    res = future.result()
+                    if res['status'] == 'success':
+                        success_count += 1
+                        task_orig_size += res['orig_size']
+                        task_new_size += res['new_size']
+                        successful_inputs.append(res['input'])
+                        logging.info(f"[SUCCESS] {res['input'].name} -> {res['output'].name}")
+                    elif res['status'] == 'skipped':
+                        skipped_count += 1
+                        logging.info(f"[SKIP] {res['input'].name} 的对应文件已存在。")
+                    elif res['status'] == 'error':
+                        error_count += 1
+                        logging.error(f"[ERROR] {res['input'].name} -> {res['error']}")
+                    
+                    progress.update(process_task, advance=1)
 
-        # 4. 移动原图 (放在同一个 progress 块内)
-        if successful_inputs:
-            move_task_id = progress.add_task("[yellow]正在归档原图...", total=len(successful_inputs))
-            move_originals(src_dir, backup_dir, successful_inputs, progress, move_task_id, is_single_file=is_single_file)
+            if successful_inputs:
+                move_task_id = progress.add_task(f"[yellow]任务 {idx} 归档原图...", total=len(successful_inputs))
+                move_originals(task_dir, backup_dir, successful_inputs, progress, move_task_id, is_single_file=is_single_file)
 
-    # --- 统计总结 ---
-    summary_title = "📊 任务总结"
+        logging.info(f"=== 任务 {idx} 结束: {datetime.datetime.now()} ===")
+        
+        logging.getLogger().removeHandler(file_handler)
+        file_handler.close()
+        
+        global_success += success_count
+        global_error += error_count
+        global_skipped += skipped_count
+        global_orig_size += task_orig_size
+        global_new_size += task_new_size
+
+    summary_title = "📊 本次所有任务总结"
     table = Table(title=summary_title, box=None, show_header=False)
     table.add_column("Key", style="bold cyan")
     table.add_column("Value")
     
-    table.add_row("成功完成", f"[green]{success_count}[/green] 张")
-    table.add_row("错误失败", f"[red]{error_count}[/red] 张")
+    table.add_row("成功完成", f"[green]{global_success}[/green] 张")
+    table.add_row("已跳过", f"[yellow]{global_skipped}[/yellow] 张")
+    table.add_row("错误失败", f"[red]{global_error}[/red] 张")
     
-    # 同时记录到日志文件
-    logging.info(summary_title)
-    logging.info(f"成功完成: {success_count} 张")
-    logging.info(f"错误失败: {error_count} 张")
-
-    if success_count > 0:
-        if mode == "compress":
-            reduction = total_orig_size - total_new_size
-            reduction_percent = (reduction / total_orig_size) * 100
-            table.add_row("原始总体积", f"{total_orig_size / (1024*1024):.2f} MB")
-            table.add_row("压缩后体积", f"{total_new_size / (1024*1024):.2f} MB")
+    if global_success > 0:
+        if mode.startswith("compress"):
+            reduction = global_orig_size - global_new_size
+            reduction_percent = (reduction / global_orig_size) * 100 if global_orig_size > 0 else 0
+            table.add_row("原始总体积", f"{global_orig_size / (1024*1024):.2f} MB")
+            table.add_row("压缩后体积", f"{global_new_size / (1024*1024):.2f} MB")
             table.add_row("空间缩减率", f"[bold green]{reduction_percent:.1f}%[/bold green] (节省 {reduction / (1024*1024):.2f} MB)")
-
-            logging.info(f"原始总体积: {total_orig_size / (1024*1024):.2f} MB")
-            logging.info(f"压缩后体积: {total_new_size / (1024*1024):.2f} MB")
-            logging.info(f"空间缩减率: {reduction_percent:.1f}% (节省 {reduction / (1024*1024):.2f} MB)")
         else:
-            table.add_row("WebP 总体积", f"{total_orig_size / (1024*1024):.2f} MB")
-            table.add_row("还原后体积", f"{total_new_size / (1024*1024):.2f} MB")
-            logging.info(f"WebP 总体积: {total_orig_size / (1024*1024):.2f} MB")
-            logging.info(f"还原后体积: {total_new_size / (1024*1024):.2f} MB")
+            table.add_row("WebP 总体积", f"{global_orig_size / (1024*1024):.2f} MB")
+            table.add_row("还原后体积", f"{global_new_size / (1024*1024):.2f} MB")
 
     console.print("\n", table)
-
-    logging.info(f"=== 任务结束: {datetime.datetime.now()} ===")
-    console.print(f"\n[bold green]✅ 任务全部完成！日志已存至源目录 logs 文件夹。[/bold green]")
+    console.print(f"\n[bold green]✅ 所有任务全部完成！分项日志已存至各自目录的 logs 文件夹。[/bold green]")
 
 if __name__ == "__main__":
     try:
